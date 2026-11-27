@@ -1,0 +1,784 @@
+import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react';
+
+// ============================================================================
+// ZEROSOUNDS0.JSX
+// ZeroByes-aligned Sega Genesis-style (1988) SFX synthesis engine
+// Chip model: YM2612-style 4-operator FM + SN76489-style PSG + 8-bit DAC burst
+// Architecture: position-is-seed, zero bytes store infinity
+// Every patch is derived O(1) from (soundName, worldSeed) via a hash chain and
+// rendered to PCM with integer tables + IEEE arithmetic only, so the JSX engine
+// and ZeroSounds0.py produce sample-identical audio (same fingerprints).
+// No Math.random(), no Math.sin/pow/exp at runtime, no LFSR state.
+// ============================================================================
+
+// ============================================================================
+// SECTION 1: ZB HASH CORE (identical to ZeroSounds v1)
+// ============================================================================
+function zbHash(key, seed = 0) {
+  let h = (seed ^ 0x9e3779b9) >>> 0;
+  if (typeof key === 'number') {
+    h ^= (key >>> 0);
+    h = Math.imul(h, 0xcc9e2d51) >>> 0;
+    h = ((h << 15) | (h >>> 17)) >>> 0;
+    h = Math.imul(h, 0x1b873593) >>> 0;
+    h ^= h >>> 16;
+    h = Math.imul(h, 0x85ebca6b) >>> 0;
+    h ^= h >>> 13;
+    h = Math.imul(h, 0xc2b2ae35) >>> 0;
+    h ^= h >>> 16;
+    return h >>> 0;
+  }
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 0x5bd1e995) >>> 0;
+    h ^= h >>> 15;
+  }
+  return h >>> 0;
+}
+function zbFloat(hash) { return (hash & 0xFFFFFF) / 0x1000000; }          // [0,1)
+function zbRange(hash, min, max) { return min + zbFloat(hash) * (max - min); }
+function zbInt(hash, min, max) { return min + (hash % (max - min + 1)); }  // inclusive
+
+// ============================================================================
+// SECTION 2: CHIP CONSTANTS + LOOKUP TABLES
+// Tables are built with + - * / and floor only, so they are bit-identical on
+// every JS engine and in Python. ZB_TABLE_FP guards against drift.
+// ============================================================================
+const ZB_SR        = 53267;     // YM2612 native rate: 7670453 Hz / 144
+const ZB_TICK_HZ   = 60;        // sound-driver update rate (one per video frame)
+const ZB_PSG_CLOCK = 3579545;   // SN76489 master clock (NTSC)
+const ZB_PI        = 3.141592653589793;
+const ZB_ENV_STEP  = 0.9892646717677409; // amplitude ratio of one 0.09375 dB step
+const ZB_PSG_VOL   = [255, 203, 161, 128, 102, 81, 64, 51, 40, 32, 26, 20, 16, 13, 10, 0]; // 2 dB/step
+const ZB_JI        = [1, 9 / 8, 5 / 4, 4 / 3, 3 / 2, 5 / 3, 15 / 8];      // just major scale
+const ZB_CARRIERS  = [[3], [3], [3], [3], [1, 3], [1, 2, 3], [1, 2, 3], [0, 1, 2, 3]];
+const ZB_ALG_ART   = [
+  '1→2→3→4', '(1+2)→3→4', '(1+(2→3))→4', '((1→2)+3)→4',
+  '(1→2)+(3→4)', '1→(2+3+4)', '(1→2)+3+4', '1+2+3+4',
+];
+
+// Quarter-wave Taylor/Horner sine: arithmetic only, accurate to ~1e-13 on (0, pi/2)
+function zbSinPoly(x) {
+  const x2 = x * x;
+  return x * (1 - x2 / 6 * (1 - x2 / 20 * (1 - x2 / 42 * (1 - x2 / 72 *
+         (1 - x2 / 110 * (1 - x2 / 156 * (1 - x2 / 210)))))));
+}
+const ZB_SIN = new Int16Array(1024);   // 10-bit phase -> signed 13-bit sine
+const ZB_AMP = new Int16Array(1024);   // 10-bit attenuation (0.09375 dB/step) -> linear gain
+(function zbBuildTables() {
+  for (let i = 0; i < 1024; i++) {
+    const q = i & 255, quad = i >> 8;
+    const x = (((quad & 1) ? 255 - q : q) + 0.5) * ZB_PI / 512;
+    const v = Math.floor(zbSinPoly(x) * 4095 + 0.5);
+    ZB_SIN[i] = quad >= 2 ? -v : v;
+  }
+  let a = 4095;
+  for (let i = 0; i < 1024; i++) { ZB_AMP[i] = Math.floor(a + 0.5); a *= ZB_ENV_STEP; }
+})();
+const ZB_TABLE_FP = 0x3B054F67;
+function zbTableFingerprint() {
+  let h = 0x7AB1E5;
+  for (let i = 0; i < 1024; i++) h = zbHash(ZB_SIN[i] & 0xFFFF, h);
+  for (let i = 0; i < 1024; i++) h = zbHash(ZB_AMP[i] & 0xFFFF, h);
+  return h >>> 0;
+}
+
+// ============================================================================
+// SECTION 3: SOUND TAXONOMY (anchor data only — no patches stored)
+// ============================================================================
+const ZB_CATEGORIES = {
+  movement:    { index: 0, freqLow: 80,  freqHigh: 400,  durLow: 0.06, durHigh: 0.25, sweep: [1.3, 3.5],  attackMax: 0.03  },
+  pickup:      { index: 1, freqLow: 500, freqHigh: 1800, durLow: 0.12, durHigh: 0.5,  sweep: [0.9, 1.6],  attackMax: 0.03  },
+  combat:      { index: 2, freqLow: 100, freqHigh: 1200, durLow: 0.06, durHigh: 0.5,  sweep: [0.15, 0.7], attackMax: 0.008 },
+  explosion:   { index: 3, freqLow: 40,  freqHigh: 300,  durLow: 0.15, durHigh: 0.9,  sweep: [0.2, 0.6],  attackMax: 0.03  },
+  ui:          { index: 4, freqLow: 300, freqHigh: 1000, durLow: 0.03, durHigh: 0.2,  sweep: [0.85, 1.4], attackMax: 0.008 },
+  power:       { index: 5, freqLow: 200, freqHigh: 1200, durLow: 0.3,  durHigh: 1.0,  sweep: [1.0, 2.0],  attackMax: 0.03  },
+  damage:      { index: 6, freqLow: 100, freqHigh: 600,  durLow: 0.08, durHigh: 0.8,  sweep: [0.3, 0.8],  attackMax: 0.03  },
+  environment: { index: 7, freqLow: 80,  freqHigh: 600,  durLow: 0.06, durHigh: 0.5,  sweep: [0.5, 2.5],  attackMax: 0.03  },
+};
+const ZB_CATEGORY_ORDER = ['movement', 'pickup', 'combat', 'explosion', 'ui', 'power', 'damage', 'environment'];
+
+// style: 0=tonal, 1=noisy, 2=arpeggio   (same anchor table as ZeroSounds v1 — 34 entries)
+const ZB_SOUNDS = {
+  jump:          { category: 'movement',    style: 0, styleIndex: 0, label: '⬆ Jump'       },
+  doubleJump:    { category: 'movement',    style: 2, styleIndex: 1, label: '⬆⬆ Dbl Jump'  },
+  dash:          { category: 'movement',    style: 1, styleIndex: 2, label: '⚡ Dash'        },
+  land:          { category: 'movement',    style: 1, styleIndex: 3, label: '⬇ Land'        },
+  coin:          { category: 'pickup',      style: 2, styleIndex: 0, label: '🪙 Coin'        },
+  gem:           { category: 'pickup',      style: 2, styleIndex: 1, label: '💎 Gem'         },
+  heart:         { category: 'pickup',      style: 2, styleIndex: 2, label: '❤ Heart'        },
+  key:           { category: 'pickup',      style: 0, styleIndex: 3, label: '🗝 Key'          },
+  laser:         { category: 'combat',      style: 0, styleIndex: 0, label: '🔴 Laser'       },
+  blaster:       { category: 'combat',      style: 1, styleIndex: 1, label: '💥 Blaster'     },
+  sword:         { category: 'combat',      style: 1, styleIndex: 2, label: '⚔ Sword'        },
+  punch:         { category: 'combat',      style: 1, styleIndex: 3, label: '👊 Punch'       },
+  magicSpell:    { category: 'combat',      style: 2, styleIndex: 4, label: '✨ Magic'        },
+  explosion:     { category: 'explosion',   style: 1, styleIndex: 0, label: '💣 Explosion'   },
+  smallExplosion:{ category: 'explosion',   style: 1, styleIndex: 1, label: '💥 Pop'          },
+  boom:          { category: 'explosion',   style: 1, styleIndex: 2, label: '💥 Boom'         },
+  menuSelect:    { category: 'ui',          style: 0, styleIndex: 0, label: '▶ Select'        },
+  menuConfirm:   { category: 'ui',          style: 2, styleIndex: 1, label: '✓ Confirm'       },
+  menuCancel:    { category: 'ui',          style: 0, styleIndex: 2, label: '✗ Cancel'        },
+  pause:         { category: 'ui',          style: 0, styleIndex: 3, label: '⏸ Pause'         },
+  textBlip:      { category: 'ui',          style: 0, styleIndex: 4, label: '💬 Text'         },
+  powerUp:       { category: 'power',       style: 2, styleIndex: 0, label: '⚡ Power Up'     },
+  levelUp:       { category: 'power',       style: 2, styleIndex: 1, label: '🏆 Level Up'     },
+  oneUp:         { category: 'power',       style: 2, styleIndex: 2, label: '1UP Extra'       },
+  heal:          { category: 'power',       style: 2, styleIndex: 3, label: '💚 Heal'         },
+  hurt:          { category: 'damage',      style: 1, styleIndex: 0, label: '💔 Hurt'         },
+  death:         { category: 'damage',      style: 2, styleIndex: 1, label: '☠ Death'         },
+  enemyHit:      { category: 'damage',      style: 1, styleIndex: 2, label: '🎯 Enemy Hit'    },
+  warning:       { category: 'damage',      style: 2, styleIndex: 3, label: '⚠ Warning'       },
+  doorOpen:      { category: 'environment', style: 0, styleIndex: 0, label: '🚪 Door'         },
+  chest:         { category: 'environment', style: 2, styleIndex: 1, label: '📦 Chest'        },
+  splash:        { category: 'environment', style: 1, styleIndex: 2, label: '💧 Splash'       },
+  teleport:      { category: 'environment', style: 0, styleIndex: 3, label: '🌀 Teleport'     },
+  footstep:      { category: 'environment', style: 1, styleIndex: 4, label: '👣 Footstep'     },
+};
+
+const CATEGORY_COLORS = {
+  movement: '#4FC3F7', pickup: '#FFD54F', combat: '#EF5350', explosion: '#FF7043',
+  ui: '#AB47BC', power: '#66BB6A', damage: '#F06292', environment: '#26A69A',
+};
+
+// Style rule tables — bounds the hash chooses within (indexed by style 0/1/2)
+const ZB_ALG_POOL    = [[4, 2, 3, 5, 6, 7, 4, 0], [0, 1, 2, 3, 0, 3], [4, 5, 6, 7, 4, 5]];
+const ZB_MUL_CAR     = [1, 2, 1, 3, 2, 4, 0.5, 1];
+const ZB_MUL_MOD     = [[1, 2, 3, 1, 4, 2, 0.5, 5], [0.5, 3, 7, 11, 13, 15, 1, 9], [1, 2, 3, 4, 2, 1, 7, 5]];
+const ZB_MOD_TL      = [[22, 48], [4, 26], [26, 50]];
+const ZB_CAR_PENALTY = [0, 0, 8, 13, 16];   // extra TL per carrier count (keeps level even)
+const ZB_PSG_CHANCE  = [0.45, 0.8, 0.6];
+const ZB_NOISE_DIV   = [512, 1024, 2048];
+
+// ============================================================================
+// SECTION 4: ZEROBYES PATCH DERIVATION (O(1))
+// Hierarchy: worldSeed -> categorySeed -> soundSeed -> slot[k] -> operator[j] -> sample[n]
+// ============================================================================
+function zbBuildPatch(seed, catName, style) {
+  const cat = ZB_CATEGORIES[catName];
+  const h = (k) => zbHash(k, seed);
+
+  const algPool   = ZB_ALG_POOL[style];
+  const algorithm = algPool[zbInt(h(0), 0, algPool.length - 1)];
+  const feedback  = style === 1 ? zbInt(h(1), 5, 7) : zbInt(h(1), 0, 4);
+  const baseFreq  = zbRange(h(2), cat.freqLow, cat.freqHigh);
+  const sw        = style === 1 ? [0.1, 0.5] : cat.sweep;
+  const freqSweep = style === 2 ? 1 : zbRange(h(3), sw[0], sw[1]);
+  let   duration  = zbRange(h(4), cat.durLow, cat.durHigh);
+  const vibrato   = (style === 0 && zbFloat(h(5)) < 0.35)
+    ? { depth: zbRange(h(6), 0.01, 0.06), rate: zbRange(h(7), 5, 14) } : null;
+
+  // Four operators — each from its own sub-seed, no cross-operator dependency
+  const carriers = ZB_CARRIERS[algorithm];
+  const operators = [0, 1, 2, 3].map((j) => {
+    const opSeed = zbHash(100 + j, seed);
+    const oh = (k) => zbHash(k, opSeed);
+    const isCar = carriers.includes(j);
+    return {
+      carrier: isCar,
+      mul: isCar ? (j === 3 ? 1 : ZB_MUL_CAR[zbInt(oh(0), 0, 7)]) : ZB_MUL_MOD[style][zbInt(oh(0), 0, 7)],
+      detune: zbInt(oh(1), 0, 6) - 3,
+      tl: isCar ? zbInt(oh(2), 0, 10) + ZB_CAR_PENALTY[carriers.length]
+                : zbInt(oh(2), ZB_MOD_TL[style][0], ZB_MOD_TL[style][1]),
+      ar:  isCar ? zbRange(oh(3), 0.001, cat.attackMax) : zbRange(oh(3), 0.001, 0.01), // seconds
+      d1r: isCar ? zbRange(oh(4), 300, 4000) : zbRange(oh(4), 500, 9000),             // att units/s
+      sl:  (isCar ? zbInt(oh(5), 0, 7) : zbInt(oh(5), 2, 13)) * 32,                   // att units (3 dB steps)
+      d2r: isCar ? zbRange(oh(6), 0, 1500) : zbRange(oh(6), 0, 3000),
+      rr:  zbRange(oh(7), 5200, 16000),
+    };
+  });
+
+  // Arpeggio: every note derived from its own index — no dependency on the previous note
+  let arpeggio = null;
+  if (style === 2) {
+    const count = zbInt(h(10), 2, 6);
+    const speedTicks = zbInt(h(11), 2, 6);
+    const stride = zbInt(h(12), 1, 3);
+    const down = catName === 'damage';
+    const noteSeed = h(13);
+    const notes = Array.from({ length: count }, (_, i) => {
+      const d = i === 0 ? 0 : i * stride + zbInt(zbHash(i, noteSeed), 0, 1);
+      const ratio = ZB_JI[d % 7] * (1 << Math.floor(d / 7));
+      return down ? baseFreq * 2 / ratio : baseFreq * ratio;
+    });
+    arpeggio = { notes, speedTicks };
+    duration = count * speedTicks / 60;
+  }
+  const gateTicks = arpeggio ? arpeggio.notes.length * arpeggio.speedTicks
+                             : Math.max(1, Math.ceil(duration * 60));
+
+  // PSG layer (square tone that tracks the FM pitch, or hash-noise)
+  const psg = zbFloat(h(20)) < ZB_PSG_CHANCE[style] ? {
+    mode: style === 1 ? (zbFloat(h(21)) < 0.8 ? 'noise' : 'periodic') : 'tone',
+    noiseRate: ZB_PSG_CLOCK / ZB_NOISE_DIV[catName === 'explosion' ? zbInt(h(22), 1, 2) : zbInt(h(22), 0, 2)],
+    toneMul: [2, 1, 2, 4][zbInt(h(23), 0, 3)],
+    atten: zbInt(h(24), 2, 6),
+    stepTicks: zbInt(h(25), 1, 6),
+  } : null;
+
+  // DAC burst (8-bit sample-and-hold hash noise) — the "crunch" under explosions and hits
+  const dacGate = catName === 'explosion' ? 0.4 : style === 1 ? 0.7 : 2;
+  const dac = zbFloat(h(30)) > dacGate ? {
+    rate: zbRange(h(31), 3000, 11000),
+    decayTicks: Math.max(2, Math.floor(duration * 60 * zbRange(h(32), 0.4, 1.0))),
+    level: zbRange(h(33), 0.4, 0.9),
+  } : null;
+
+  // Driver echo: the whole voice replayed once, late and quieter (the spare-channel trick)
+  const echoChance = ['environment', 'power', 'pickup'].includes(catName) ? 0.6 : 0.2;
+  const echo = zbFloat(h(40)) < echoChance
+    ? { delayTicks: zbInt(h(41), 3, 12), shift: zbInt(h(42), 1, 2) } : null;
+
+  return {
+    soundSeed: seed, category: catName, style,
+    algorithm, feedback, baseFreq, freqSweep, duration, gateTicks,
+    vibrato, operators, arpeggio, psg, dac, echo,
+  };
+}
+
+function zbDeriveParams(soundName, worldSeed = 0x1337BEEF) {
+  const sound = ZB_SOUNDS[soundName];
+  if (!sound) throw new Error(`Unknown sound: ${soundName}`);
+  const catSeed   = zbHash(ZB_CATEGORIES[sound.category].index, worldSeed);
+  const soundSeed = zbHash(sound.styleIndex, catSeed);
+  return zbBuildPatch(soundSeed, sound.category, sound.style);
+}
+
+// Deterministic "random" patch: an unnamed sound at position numericSeed
+function zbRandomize(numericSeed, worldSeed = 0x1337BEEF) {
+  const vSeed = zbHash(numericSeed, worldSeed);
+  const catName = ZB_CATEGORY_ORDER[zbInt(zbHash(900, vSeed), 0, 7)];
+  const style = zbInt(zbHash(901, vSeed), 0, 2);
+  return zbBuildPatch(vSeed, catName, style);
+}
+
+// ============================================================================
+// SECTION 5: CHIP RENDERER  patch -> Int16Array PCM @ 53267 Hz
+// Per-sample path: integer table lookups, shifts, and IEEE + - * / only.
+// ============================================================================
+function zbRender(p, opts = {}) {
+  const ladder  = opts.ladder !== false;    // YM2612 DAC crossover ("ladder") distortion
+  const lowpass = opts.lowpass !== false;   // Model 1 output low-pass (~3.39 kHz, 1st order)
+  const SR = ZB_SR;
+  const gateTicks   = p.gateTicks;
+  const gateSamples = Math.floor(gateTicks * SR / 60);
+  const echoSamples = p.echo ? Math.floor(p.echo.delayTicks * SR / 60) : 0;
+  const n   = gateSamples + Math.floor(SR / 4) + echoSamples;
+  const buf = new Float64Array(n);
+
+  const ops   = p.operators;
+  const phase = [0, 0, 0, 0], inc = [0, 0, 0, 0], att = [1023, 1023, 1023, 1023], stage = [0, 0, 0, 0];
+  const arK   = ops.map((o) => Math.min(1, 6.93 / (o.ar * SR)));
+  const d1    = ops.map((o) => o.d1r / SR);
+  const d2    = ops.map((o) => o.d2r / SR);
+  const rr    = ops.map((o) => o.rr / SR);
+  const sl    = ops.map((o) => o.sl);
+  const tlAtt = ops.map((o) => o.tl * 8);
+  const alg = p.algorithm, fb = p.feedback, fbShift = 9 - fb;
+  const arp = p.arpeggio, psg = p.psg, dac = p.dac, vib = p.vibrato;
+  const f0 = p.baseFreq, f1 = p.baseFreq * p.freqSweep;
+  const nSeed = (p.soundSeed ^ 0x5E5E5E5E) >>> 0;
+  const dSeed = (p.soundSeed ^ 0xDAC0DAC0) >>> 0;
+
+  let fb1 = 0, fb2 = 0, lastTick = -1, keyedOff = false, noteIdx = 0, lastNote = -1;
+  let psgPhase = 0, psgInc = 0, psgVol = 0, nIdx = -1, nVal = 0;
+  let dacAmp = 0, dIdx = -1, dVal = 0;
+
+  // One operator: envelope step -> phase step -> sine lookup -> gain lookup
+  const op = (j, mod) => {
+    let a = att[j];
+    const st = stage[j];
+    if (st === 0)      { a -= a * arK[j]; if (a < 1) { a = 0; stage[j] = 1; } }
+    else if (st === 1) { a += d1[j]; if (a >= sl[j]) { a = sl[j]; stage[j] = 2; } }
+    else if (st === 2) { a += d2[j]; if (a > 1023) a = 1023; }
+    else               { a += rr[j]; if (a > 1023) a = 1023; }
+    att[j] = a;
+    let t = (a | 0) + tlAtt[j]; if (t > 1023) t = 1023;
+    phase[j] = (phase[j] + inc[j]) & 0xFFFFF;
+    return (ZB_SIN[((phase[j] >> 10) + mod) & 1023] * ZB_AMP[t]) >> 12;
+  };
+
+  for (let i = 0; i < n; i++) {
+    // ── driver tick (60 Hz): pitch, key on/off, PSG volume, DAC level ──
+    const tick = Math.floor(i * 60 / SR);
+    if (tick !== lastTick) {
+      lastTick = tick;
+      let freq;
+      if (arp) {
+        noteIdx = Math.min(Math.floor(tick / arp.speedTicks), arp.notes.length - 1);
+        freq = arp.notes[noteIdx];
+        if (noteIdx !== lastNote) { lastNote = noteIdx; stage[0] = stage[1] = stage[2] = stage[3] = 0; }
+      } else {
+        const gt = tick < gateTicks ? tick : gateTicks;
+        freq = f0 + (f1 - f0) * gt / gateTicks;
+      }
+      if (vib) {
+        const x = tick * vib.rate / 60, fr = x - Math.floor(x);
+        freq *= 1 + vib.depth * (fr < 0.5 ? 4 * fr - 1 : 3 - 4 * fr);
+      }
+      for (let j = 0; j < 4; j++) {
+        const v = Math.floor(freq * ops[j].mul * 1048576 / SR) + ops[j].detune * 4;
+        inc[j] = v > 0 ? v : 0;
+      }
+      if (!keyedOff && tick >= gateTicks) { keyedOff = true; stage[0] = stage[1] = stage[2] = stage[3] = 3; }
+      if (psg) {
+        const pt = arp ? tick - noteIdx * arp.speedTicks : tick;
+        let a = psg.atten + Math.floor(pt / psg.stepTicks);
+        if (tick >= gateTicks) a += (tick - gateTicks + 1) * 4;
+        psgVol = ZB_PSG_VOL[a > 15 ? 15 : a];
+        if (psg.mode === 'tone') {
+          let N = Math.floor(ZB_PSG_CLOCK / (32 * freq * psg.toneMul) + 0.5);
+          if (N < 9) N = 9; else if (N > 1023) N = 1023;           // 10-bit period register
+          psgInc = ZB_PSG_CLOCK / (32 * N) / SR;
+        }
+      }
+      if (dac) dacAmp = tick < dac.decayTicks ? dac.level * (1 - tick / dac.decayTicks) : 0;
+    }
+
+    // ── YM2612 channel: 4 operators routed by one of 8 algorithms ──
+    const o1 = op(0, fb ? (fb1 + fb2) >> fbShift : 0);
+    fb2 = fb1; fb1 = o1;
+    let out, o2, o3;
+    switch (alg) {
+      case 0: o2 = op(1, o1); o3 = op(2, o2); out = op(3, o3); break;
+      case 1: o2 = op(1, 0);  o3 = op(2, o1 + o2); out = op(3, o3); break;
+      case 2: o2 = op(1, 0);  o3 = op(2, o2); out = op(3, o1 + o3); break;
+      case 3: o2 = op(1, o1); o3 = op(2, 0);  out = op(3, o2 + o3); break;
+      case 4: o2 = op(1, o1); o3 = op(2, 0);  out = o2 + op(3, o3); break;
+      case 5: o2 = op(1, o1); o3 = op(2, o1); out = o2 + o3 + op(3, o1); break;
+      case 6: o2 = op(1, o1); o3 = op(2, 0);  out = o2 + o3 + op(3, 0); break;
+      default: o2 = op(1, 0); o3 = op(2, 0);  out = o1 + o2 + o3 + op(3, 0);
+    }
+    if (out > 4095) out = 4095; else if (out < -4095) out = -4095;
+    let fm = out >> 4;                                             // 9-bit DAC
+    if (ladder) fm = fm > 0 ? fm + 3 : fm < 0 ? fm - 3 : 0;
+    let s = fm / 256 * 0.7;
+
+    // ── SN76489 voice ──
+    if (psg) {
+      let sq;
+      if (psg.mode === 'tone') {
+        psgPhase += psgInc; if (psgPhase >= 1) psgPhase -= 1;
+        sq = psgPhase < 0.5 ? 1 : -1;
+      } else {
+        const k = Math.floor(i * psg.noiseRate / SR);
+        if (k !== nIdx) {
+          nIdx = k;                                                // O(1) noise: bit k depends only on (k, seed)
+          nVal = psg.mode === 'noise' ? ((zbHash(k, nSeed) & 1) ? 1 : -1) : ((k & 15) === 0 ? 1 : -1 / 15);
+        }
+        sq = nVal;
+      }
+      s += sq * psgVol / 255 * 0.2;
+    }
+
+    // ── 8-bit DAC burst ──
+    if (dac && dacAmp > 0) {
+      const k = Math.floor(i * dac.rate / SR);
+      if (k !== dIdx) { dIdx = k; dVal = ((zbHash(k, dSeed) & 0xFF) - 128) / 128; }
+      s += dVal * dacAmp * 0.45;
+    }
+    buf[i] = s;
+  }
+
+  // single-tap echo (descending so the tap always reads the dry signal)
+  if (p.echo) {
+    const g = p.echo.shift === 1 ? 0.5 : 0.25;
+    for (let i = n - 1; i >= echoSamples; i--) buf[i] += buf[i - echoSamples] * g;
+  }
+
+  // output stage: one-pole low-pass, then 16-bit quantise
+  const pcm = new Int16Array(n);
+  const w = 2 * ZB_PI * 3390 / SR, a = w / (1 + w);
+  let y = 0;
+  for (let i = 0; i < n; i++) {
+    if (lowpass) y += a * (buf[i] - y); else y = buf[i];
+    let v = Math.floor(y * 1.25 * 32767 + 0.5);
+    if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+    pcm[i] = v;
+  }
+  return pcm;
+}
+
+// 32-bit fingerprint of a PCM buffer — equal fingerprints mean equal audio
+function zbFingerprint(pcm) {
+  let h = zbHash(pcm.length, 0x5E6A1988);
+  for (let i = 0; i < pcm.length; i++) h = zbHash(pcm[i] & 0xFFFF, h);
+  return h >>> 0;
+}
+const zbHex = (v) => '0x' + (v >>> 0).toString(16).toUpperCase().padStart(8, '0');
+
+// 16-bit mono WAV container around a PCM buffer
+function zbEncodeWav(pcm, sampleRate = ZB_SR) {
+  const ab = new ArrayBuffer(44 + pcm.length * 2), dv = new DataView(ab);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); dv.setUint32(4, 36 + pcm.length * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, sampleRate, true); dv.setUint32(28, sampleRate * 2, true);
+  dv.setUint16(32, 2, true); dv.setUint16(34, 16, true); str(36, 'data');
+  dv.setUint32(40, pcm.length * 2, true);
+  for (let i = 0; i < pcm.length; i++) dv.setInt16(44 + i * 2, pcm[i], true);
+  return ab;
+}
+
+// ============================================================================
+// SECTION 6: VERIFICATION
+// Golden fingerprints: worldSeed 0x1337BEEF, default options, produced by
+// ZeroSounds0.py. A match proves this engine is sample-identical to Python.
+// ============================================================================
+const ZB_GOLDEN = {
+  jump: 0xCEA9CA69, doubleJump: 0xE53C4215, dash: 0x4610CF0C,
+  land: 0x96C8E8FB, coin: 0x73FD5AAF, gem: 0x120B18A0,
+  heart: 0x0DD9C8C0, key: 0xF0141C9C, laser: 0xC450C779,
+  blaster: 0x14567ED7, sword: 0xD5DE5693, punch: 0xE513B237,
+  magicSpell: 0x59157DB4, explosion: 0x8E5253A1, smallExplosion: 0x19E03E92,
+  boom: 0x050A8B1A, menuSelect: 0x3138A307, menuConfirm: 0xFD0924A9,
+  menuCancel: 0x197F0BBD, pause: 0x0F0153F7, textBlip: 0xCC8D4755,
+  powerUp: 0xF302B4FC, levelUp: 0x00A934EF, oneUp: 0xA76983C8,
+  heal: 0x356051DD, hurt: 0x6D30E5C5, death: 0x8A5E25A6,
+  enemyHit: 0x8BECF53E, warning: 0x984CFC2C, doorOpen: 0x8E3DCC18,
+  chest: 0x3076232F, splash: 0x6E21844D, teleport: 0xE2CD9D45,
+  footstep: 0xB4F3BB6B,
+};
+
+function zbVerifyAll(worldSeed = 0x1337BEEF) {
+  const results = {};
+  const tablesOk = zbTableFingerprint() === ZB_TABLE_FP;
+  Object.keys(ZB_SOUNDS).forEach((name) => {
+    const a = zbDeriveParams(name, worldSeed), b = zbDeriveParams(name, worldSeed);
+    const fpA = zbFingerprint(zbRender(a)), fpB = zbFingerprint(zbRender(b));
+    const paramsOk = JSON.stringify(a) === JSON.stringify(b);
+    const golden = (worldSeed >>> 0) === 0x1337BEEF ? ZB_GOLDEN[name] === fpA : null;
+    results[name] = {
+      ok: paramsOk && fpA === fpB && tablesOk && golden !== false,
+      fingerprint: zbHex(fpA), paramsOk, audioOk: fpA === fpB, tablesOk, golden,
+    };
+  });
+  return results;
+}
+
+// ============================================================================
+// SECTION 7: PLAYBACK ENGINE
+// ============================================================================
+class ZBEngine {
+  constructor() { this.ctx = null; this.masterGain = null; this._cache = new Map(); }
+
+  init() {
+    if (this.ctx) return;
+    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    this.masterGain = this.ctx.createGain();
+    this.masterGain.gain.value = 0.55;
+    this.masterGain.connect(this.ctx.destination);
+  }
+  resume() { if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume(); }
+  setVolume(v) { if (this.masterGain) this.masterGain.gain.value = v; }
+
+  // Render (cached) without needing an AudioContext
+  render(params, opts = {}) {
+    const key = [params.soundSeed, params.category, params.style, opts.ladder !== false, opts.lowpass !== false].join(':');
+    let hit = this._cache.get(key);
+    if (!hit) {
+      const pcm = zbRender(params, opts);
+      hit = { pcm, fingerprint: zbFingerprint(pcm) };
+      if (this._cache.size >= 64) this._cache.delete(this._cache.keys().next().value);
+      this._cache.set(key, hit);
+    }
+    return hit;
+  }
+
+  play(params, opts = {}) {
+    const hit = this.render(params, opts);
+    if (!this.ctx) return hit;
+    const buffer = this.ctx.createBuffer(1, hit.pcm.length, ZB_SR);  // browser resamples from 53267 Hz
+    const ch = buffer.getChannelData(0);
+    for (let i = 0; i < hit.pcm.length; i++) ch[i] = hit.pcm[i] / 32768;
+    const src = this.ctx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(this.masterGain);
+    src.start();
+    return hit;
+  }
+}
+
+// ============================================================================
+// SECTION 8: REACT COMPONENT
+// ============================================================================
+const C = { bg: '#08090c', panel: '#111319', line: '#232733', text: '#e4e6ee', dim: '#6b7285',
+            blue: '#2f7bff', red: '#ff2d46', green: '#34d399' };
+
+function Scope({ pcm }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const cv = ref.current; if (!cv) return;
+    const g = cv.getContext('2d'), W = cv.width, H = cv.height;
+    g.clearRect(0, 0, W, H);
+    g.strokeStyle = C.line; g.beginPath(); g.moveTo(0, H / 2); g.lineTo(W, H / 2); g.stroke();
+    if (!pcm) return;
+    g.strokeStyle = C.blue; g.lineWidth = 1; g.beginPath();
+    const per = pcm.length / W;
+    for (let x = 0; x < W; x++) {
+      let lo = 32767, hi = -32768;
+      const end = Math.min(pcm.length, Math.floor((x + 1) * per));
+      for (let i = Math.floor(x * per); i < end; i++) { const v = pcm[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+      g.moveTo(x + 0.5, H / 2 - (hi / 32768) * (H / 2));
+      g.lineTo(x + 0.5, H / 2 - (lo / 32768) * (H / 2) + 1);
+    }
+    g.stroke();
+  }, [pcm]);
+  return <canvas ref={ref} width={520} height={72} style={styles.scope} />;
+}
+
+export default function ZeroSounds0({ initialSeed = 0x1337BEEF }) {
+  const engineRef = useRef(null);
+  const [worldSeed, setWorldSeed]   = useState(initialSeed >>> 0);
+  const [seedText, setSeedText]     = useState(zbHex(initialSeed));
+  const [patchCounter, setPatchCounter] = useState(0);
+  const [category, setCategory]     = useState('all');
+  const [volume, setVolume]         = useState(0.55);
+  const [ladder, setLadder]         = useState(true);
+  const [lowpass, setLowpass]       = useState(true);
+  const [activeSound, setActiveSound] = useState(null);
+  const [last, setLast]             = useState(null);   // { name, params, pcm, fingerprint }
+  const [verify, setVerify]         = useState(null);
+
+  const getEngine = () => (engineRef.current || (engineRef.current = new ZBEngine()));
+  const applySeed = (v) => { const s = v >>> 0; setWorldSeed(s); setSeedText(zbHex(s)); setVerify(null); };
+
+  // All patches re-derived only when the world seed changes
+  const patches = useMemo(() => Object.fromEntries(
+    Object.keys(ZB_SOUNDS).map((n) => [n, zbDeriveParams(n, worldSeed)])), [worldSeed]);
+
+  const playSound = useCallback((name, params) => {
+    const eng = getEngine(); eng.init(); eng.resume();
+    const { pcm, fingerprint } = eng.play(params, { ladder, lowpass });
+    setLast({ name, params, pcm, fingerprint });
+    setActiveSound(name);
+    setTimeout(() => setActiveSound((s) => (s === name ? null : s)), 250);
+  }, [ladder, lowpass]);
+
+  const nextPatch = () => {
+    const n = patchCounter + 1;
+    setPatchCounter(n);
+    playSound(`patch#${n}`, zbRandomize(n, worldSeed));
+  };
+
+  const exportWav = () => {
+    if (!last) return;
+    const url = URL.createObjectURL(new Blob([zbEncodeWav(last.pcm)], { type: 'audio/wav' }));
+    const a = document.createElement('a');
+    a.href = url; a.download = `${last.name.replace('#', '-')}_${zbHex(worldSeed)}.wav`; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const sounds = Object.entries(ZB_SOUNDS).filter(([, s]) => category === 'all' || s.category === category);
+  const verifyRows = verify ? Object.entries(verify) : [];
+  const allOk = verifyRows.length > 0 && verifyRows.every(([, r]) => r.ok);
+  const p = last && last.params;
+
+  return (
+    <div style={styles.root}>
+      <header style={styles.header}>
+        <div>
+          <h1 style={styles.title}>ZERO<span style={{ color: C.blue }}>SOUNDS</span><span style={{ color: C.red }}>0</span></h1>
+          <p style={styles.subtitle}>16-BIT FM · 4-OP + PSG + DAC · POSITION-IS-SEED</p>
+        </div>
+        <div style={{ textAlign: 'right' }}>
+          <div style={styles.label}>WORLD SEED</div>
+          <div style={styles.seedValue}>{zbHex(worldSeed)}</div>
+        </div>
+      </header>
+
+      <div style={styles.layout}>
+        <aside style={styles.sidebar}>
+          <section style={styles.panel}>
+            <h2 style={styles.panelTitle}>World Seed</h2>
+            <p style={styles.hint}>One integer re-voices all {Object.keys(ZB_SOUNDS).length} sounds. Share it and anyone reproduces the exact samples.</p>
+            <input type="range" min={0} max={0xFFFFFFFF} step={1337} value={worldSeed}
+              onChange={(e) => applySeed(Number(e.target.value))} style={styles.slider} />
+            <div style={styles.row}>
+              <input type="text" value={seedText} spellCheck={false} style={styles.input}
+                onChange={(e) => setSeedText(e.target.value)}
+                onBlur={() => { const v = parseInt(seedText, 16); applySeed(isNaN(v) ? worldSeed : v); }}
+                onKeyDown={(e) => { if (e.key === 'Enter') e.target.blur(); }} />
+              {/* The clock is read only here, at the user's edge, to pick a seed — never inside synthesis */}
+              <button style={styles.btnSmall} onClick={() => applySeed(zbHash(Date.now() & 0xFFFFFFFF, 0x42))}>RND</button>
+            </div>
+          </section>
+
+          <section style={styles.panel}>
+            <h2 style={styles.panelTitle}>Output Stage</h2>
+            <input type="range" min={0} max={1} step={0.01} value={volume} style={styles.slider}
+              onChange={(e) => { const v = Number(e.target.value); setVolume(v); if (engineRef.current) engineRef.current.setVolume(v); }} />
+            <div style={styles.val}>volume {Math.round(volume * 100)}%</div>
+            <label style={styles.check}><input type="checkbox" checked={ladder} onChange={(e) => setLadder(e.target.checked)} /> DAC ladder distortion</label>
+            <label style={styles.check}><input type="checkbox" checked={lowpass} onChange={(e) => setLowpass(e.target.checked)} /> Model 1 low-pass (3.39 kHz)</label>
+          </section>
+
+          <section style={styles.panel}>
+            <h2 style={styles.panelTitle}>Infinite Patch Space</h2>
+            <p style={styles.hint}>Each press is the next position in hash-space — a full FM patch from one counter.</p>
+            <button style={styles.btnPrimary} onClick={nextPatch}>◈ NEXT PATCH [{patchCounter}]</button>
+          </section>
+
+          <section style={styles.panel}>
+            <h2 style={styles.panelTitle}>ZB Compliance Test</h2>
+            <p style={styles.hint}>Derives and renders every sound twice, compares PCM fingerprints, and at seed 0x1337BEEF checks them against the Python reference.</p>
+            <button style={{ ...styles.btnPrimary, borderColor: C.green, color: C.green, background: 'rgba(52,211,153,0.08)' }}
+              onClick={() => setVerify(zbVerifyAll(worldSeed))}>▶ RUN VERIFY ({Object.keys(ZB_SOUNDS).length} SOUNDS)</button>
+            {verify && (
+              <div style={styles.list}>
+                <div style={{ ...styles.listRow, color: allOk ? C.green : C.red, fontWeight: 700 }}>
+                  <span>{allOk ? '✓ ALL DETERMINISTIC' : '✗ VIOLATIONS FOUND'}</span>
+                  <span>{verifyRows[0][1].golden === null ? 'no golden set for this seed' : 'golden: Python'}</span>
+                </div>
+                {verifyRows.map(([name, r]) => (
+                  <div key={name} style={styles.listRow}>
+                    <span style={{ color: C.dim }}>{name}</span>
+                    <span style={{ color: r.ok ? C.green : C.red }}>{r.fingerprint} {r.ok ? '✓' : '✗'}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+        </aside>
+
+        <main style={styles.main}>
+          <div style={styles.catBar}>
+            {['all', ...ZB_CATEGORY_ORDER].map((cat) => {
+              const on = category === cat, col = cat === 'all' ? C.blue : CATEGORY_COLORS[cat];
+              return (
+                <button key={cat} onClick={() => setCategory(cat)}
+                  style={{ ...styles.catBtn, borderColor: on ? col : col + '55', color: on ? col : C.dim, background: on ? col + '22' : 'transparent' }}>
+                  {cat.toUpperCase()}
+                </button>
+              );
+            })}
+          </div>
+
+          <div style={styles.grid}>
+            {sounds.map(([name, def]) => {
+              const col = CATEGORY_COLORS[def.category], pt = patches[name], on = activeSound === name;
+              return (
+                <button key={name} onClick={() => playSound(name, pt)}
+                  style={{ ...styles.soundBtn, borderColor: on ? col : col + '44', background: on ? col + '2e' : C.panel,
+                           transform: on ? 'scale(0.96)' : 'scale(1)' }}>
+                  <div style={{ ...styles.soundLabel, color: on ? col : C.text }}>{def.label}</div>
+                  <div style={styles.meta}><span style={{ color: col }}>{def.category}</span><span>{Math.round(pt.baseFreq)}Hz</span></div>
+                  <div style={styles.meta}><span>ALG {pt.algorithm} · FB {pt.feedback}</span>
+                    <span>FM{pt.psg ? '+PSG' : ''}{pt.dac ? '+DAC' : ''}{pt.arpeggio ? ' ARP' : ''}</span></div>
+                </button>
+              );
+            })}
+          </div>
+
+          <section style={styles.panel}>
+            <h2 style={styles.panelTitle}>
+              Patch Inspector {last ? `— ${last.name}` : ''}
+              {last && <button style={{ ...styles.btnSmall, marginLeft: 'auto' }} onClick={exportWav}>⬇ EXPORT WAV</button>}
+            </h2>
+            <Scope pcm={last ? last.pcm : null} />
+            {!p && <p style={styles.hint}>Click a sound to see its derived FM patch, rendered waveform and audio fingerprint.</p>}
+            {p && (
+              <div>
+                <div style={styles.kv}>
+                  <span>fingerprint <b style={{ color: C.blue }}>{zbHex(last.fingerprint)}</b></span>
+                  <span>soundSeed <b>{zbHex(p.soundSeed)}</b></span>
+                  <span>algorithm <b>{p.algorithm}: {ZB_ALG_ART[p.algorithm]}</b></span>
+                  <span>feedback <b>{p.feedback}</b></span>
+                  <span>freq <b>{p.baseFreq.toFixed(1)} Hz ×{p.freqSweep.toFixed(2)}</b></span>
+                  <span>length <b>{p.gateTicks} ticks</b></span>
+                  {p.vibrato && <span>vibrato <b>{p.vibrato.rate.toFixed(1)} Hz ±{(p.vibrato.depth * 100).toFixed(1)}%</b></span>}
+                  {p.arpeggio && <span>arp <b>[{p.arpeggio.notes.map((f) => Math.round(f)).join(', ')}] / {p.arpeggio.speedTicks}t</b></span>}
+                  {p.psg && <span>PSG <b>{p.psg.mode}{p.psg.mode === 'tone' ? ` ×${p.psg.toneMul}` : ` ${Math.round(p.psg.noiseRate)}Hz`} att {p.psg.atten} +1/{p.psg.stepTicks}t</b></span>}
+                  {p.dac && <span>DAC <b>{Math.round(p.dac.rate)} Hz, {p.dac.decayTicks}t</b></span>}
+                  {p.echo && <span>echo <b>{p.echo.delayTicks}t, −{p.echo.shift * 6} dB</b></span>}
+                </div>
+                <table style={styles.table}>
+                  <thead><tr>{['OP', 'ROLE', 'MUL', 'DT', 'TL', 'AR ms', 'D1R', 'SL', 'D2R', 'RR'].map((x) => <th key={x} style={styles.th}>{x}</th>)}</tr></thead>
+                  <tbody>
+                    {p.operators.map((o, j) => (
+                      <tr key={j}>
+                        <td style={styles.td}>{j + 1}</td>
+                        <td style={{ ...styles.td, color: o.carrier ? C.blue : C.red }}>{o.carrier ? 'carrier' : 'modulator'}</td>
+                        <td style={styles.td}>{o.mul}</td><td style={styles.td}>{o.detune}</td><td style={styles.td}>{o.tl}</td>
+                        <td style={styles.td}>{(o.ar * 1000).toFixed(1)}</td><td style={styles.td}>{Math.round(o.d1r)}</td>
+                        <td style={styles.td}>{o.sl}</td><td style={styles.td}>{Math.round(o.d2r)}</td><td style={styles.td}>{Math.round(o.rr)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+
+          <div style={styles.laws}>
+            {[
+              ['O(1) Access', 'Any patch field, note or noise sample comes straight from its coordinates'],
+              ['Parallelism', 'Every slot and operator hashes from its own sub-seed'],
+              ['Coherence', 'Sounds in a category share a seed and stay in character'],
+              ['Hierarchy', 'world → category → sound → slot → operator → sample'],
+              ['Determinism', 'Same seed = same PCM fingerprint, in JS and Python'],
+            ].map(([law, desc]) => (
+              <div key={law} style={styles.lawCard}><div style={styles.lawName}>{law}</div><div style={styles.lawDesc}>{desc}</div></div>
+            ))}
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// STYLES
+// ============================================================================
+const styles = {
+  root: { background: C.bg, minHeight: '100vh', color: C.text, boxSizing: 'border-box',
+          fontFamily: '"JetBrains Mono", "Fira Code", Consolas, "Courier New", monospace' },
+  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '14px 24px',
+            borderBottom: `2px solid ${C.red}`, background: 'linear-gradient(180deg,#14161d,#0b0c10)' },
+  title: { margin: 0, fontSize: 28, fontWeight: 900, letterSpacing: 4, fontStyle: 'italic' },
+  subtitle: { margin: '4px 0 0', fontSize: 10, color: C.dim, letterSpacing: 2 },
+  label: { fontSize: 10, color: C.dim, letterSpacing: 2 },
+  seedValue: { fontSize: 18, color: C.blue, letterSpacing: 2 },
+  layout: { display: 'flex', flexWrap: 'wrap', maxWidth: 1400, margin: '0 auto' },
+  sidebar: { flex: '0 0 290px', padding: 16, display: 'flex', flexDirection: 'column', gap: 12, boxSizing: 'border-box' },
+  main: { flex: '1 1 480px', minWidth: 0, padding: 16, display: 'flex', flexDirection: 'column', gap: 14 },
+  panel: { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 6, padding: 14 },
+  panelTitle: { margin: '0 0 10px', fontSize: 11, letterSpacing: 2, color: C.text, textTransform: 'uppercase',
+                display: 'flex', alignItems: 'center', gap: 8 },
+  hint: { margin: '0 0 10px', fontSize: 11, color: C.dim, lineHeight: 1.5 },
+  slider: { width: '100%', cursor: 'pointer', accentColor: C.blue },
+  row: { display: 'flex', gap: 6, marginTop: 8 },
+  input: { flex: 1, minWidth: 0, background: C.bg, border: `1px solid ${C.line}`, borderRadius: 4, color: C.blue,
+           fontFamily: 'inherit', fontSize: 12, padding: '6px 8px', outline: 'none' },
+  val: { fontSize: 11, color: C.dim, margin: '4px 0 8px', textAlign: 'right' },
+  check: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: C.text, marginTop: 6, cursor: 'pointer' },
+  btnSmall: { background: '#1a1d26', border: `1px solid ${C.line}`, borderRadius: 4, color: C.text, fontFamily: 'inherit',
+              fontSize: 10, padding: '6px 10px', cursor: 'pointer', letterSpacing: 1 },
+  btnPrimary: { width: '100%', background: 'rgba(47,123,255,0.12)', border: `1px solid ${C.blue}`, borderRadius: 4,
+                color: C.blue, fontFamily: 'inherit', fontSize: 11, padding: 10, cursor: 'pointer', letterSpacing: 2 },
+  list: { marginTop: 10, maxHeight: 190, overflowY: 'auto', background: C.bg, border: `1px solid ${C.line}`, borderRadius: 4, padding: 8 },
+  listRow: { display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 10, marginBottom: 3 },
+  catBar: { display: 'flex', flexWrap: 'wrap', gap: 6 },
+  catBtn: { border: '1px solid', borderRadius: 4, fontFamily: 'inherit', fontSize: 10, padding: '6px 10px', cursor: 'pointer', letterSpacing: 1 },
+  grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))', gap: 8 },
+  soundBtn: { border: '1px solid', borderRadius: 6, padding: '12px 10px', cursor: 'pointer', textAlign: 'left',
+              transition: 'all 0.08s ease', fontFamily: 'inherit' },
+  soundLabel: { fontSize: 12, fontWeight: 700, marginBottom: 6 },
+  meta: { display: 'flex', justifyContent: 'space-between', fontSize: 9, color: C.dim, marginBottom: 2 },
+  scope: { width: '100%', height: 72, background: C.bg, border: `1px solid ${C.line}`, borderRadius: 4, display: 'block', marginBottom: 10 },
+  kv: { display: 'flex', flexWrap: 'wrap', gap: '4px 18px', fontSize: 11, color: C.dim, marginBottom: 10 },
+  table: { width: '100%', borderCollapse: 'collapse', fontSize: 11 },
+  th: { textAlign: 'left', color: C.dim, fontWeight: 400, padding: '3px 6px', borderBottom: `1px solid ${C.line}`, fontSize: 10 },
+  td: { padding: '3px 6px', borderBottom: `1px solid ${C.line}` },
+  laws: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8 },
+  lawCard: { background: C.panel, border: `1px solid ${C.line}`, borderBottom: `2px solid ${C.blue}`, borderRadius: 6, padding: 10 },
+  lawName: { fontSize: 11, color: C.blue, fontWeight: 700, marginBottom: 4 },
+  lawDesc: { fontSize: 10, color: C.dim, lineHeight: 1.4 },
+};
+
+export {
+  zbHash, zbFloat, zbRange, zbInt, zbHex,
+  zbBuildPatch, zbDeriveParams, zbRandomize, zbRender, zbFingerprint, zbTableFingerprint,
+  zbEncodeWav, zbVerifyAll, ZBEngine,
+  ZB_SOUNDS, ZB_CATEGORIES, ZB_CATEGORY_ORDER, ZB_GOLDEN, ZB_SR,
+};
